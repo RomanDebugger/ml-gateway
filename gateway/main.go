@@ -3,14 +3,18 @@ package main
 import (
 	"fmt"
 	"log/slog"
+	"ml-gateway/gateway/metrics"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/joho/godotenv"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"golang.org/x/time/rate"
 	"gopkg.in/yaml.v2"
 )
@@ -63,6 +67,33 @@ func rateLimiterMiddleware(next http.Handler, logger *slog.Logger) http.Handler 
 	})
 }
 
+func metricsMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		rw := &responseWriter{ResponseWriter: w}
+
+		// Serve the request
+		next.ServeHTTP(rw, r)
+
+		duration := time.Since(start).Seconds()
+		statusCode := rw.statusCode
+
+		// Record the metrics
+		metrics.HTTPRequestDuration.WithLabelValues(r.URL.Path, r.Method).Observe(duration)
+		metrics.HTTPRequestsTotal.WithLabelValues(r.URL.Path, r.Method, strconv.Itoa(statusCode)).Inc()
+	})
+}
+
+type responseWriter struct {
+	http.ResponseWriter
+	statusCode int
+}
+
+func (rw *responseWriter) WriteHeader(code int) {
+	rw.statusCode = code
+	rw.ResponseWriter.WriteHeader(code)
+}
+
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 
@@ -77,6 +108,15 @@ func main() {
 		logger.Error("failed to load configuration", "error", err)
 		os.Exit(1)
 	}
+
+	go func() {
+		metricsMux := http.NewServeMux()
+		metricsMux.Handle("/metrics", promhttp.Handler())
+		logger.Info("Starting metrics server", "port", 9091)
+		if err := http.ListenAndServe(":9091", metricsMux); err != nil {
+			logger.Error("failed to start metrics server", "error", err)
+		}
+	}()
 
 	mux := http.NewServeMux()
 	for _, route := range config.Routes {
@@ -93,6 +133,7 @@ func main() {
 		var finalHandler http.Handler = proxyHandler
 		finalHandler = rateLimiterMiddleware(finalHandler, logger)
 		finalHandler = authenticationMiddleware(finalHandler, validApiKeys, logger)
+		finalHandler = metricsMiddleware(finalHandler)
 		mux.Handle(route.Path, finalHandler)
 	}
 
@@ -104,7 +145,7 @@ func main() {
 }
 
 func loadApiKeys(logger *slog.Logger) ([]string, error) {
-	if err := godotenv.Load("../.env"); err != nil {
+	if err := godotenv.Load(".env"); err != nil {
 		logger.Warn("could not load .env file", "error", err)
 	}
 
@@ -116,7 +157,7 @@ func loadApiKeys(logger *slog.Logger) ([]string, error) {
 }
 
 func loadConfig(logger *slog.Logger) (*Config, error) {
-	configFile, err := os.ReadFile("../config.yaml")
+	configFile, err := os.ReadFile("config.yaml")
 	if err != nil {
 		return nil, fmt.Errorf("could not read config file: %w", err)
 	}
