@@ -1,7 +1,12 @@
 package main
 
 import (
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
+	"io"
 	"log/slog"
 	"ml-gateway/gateway/metrics"
 	"net/http"
@@ -15,6 +20,7 @@ import (
 
 	"github.com/joho/godotenv"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/redis/go-redis/v9"
 	"golang.org/x/time/rate"
 	"gopkg.in/yaml.v2"
 )
@@ -26,6 +32,46 @@ type Config struct {
 type Route struct {
 	Path       string `yaml:"path"`
 	ServiceURL string `yaml:"service_url"`
+}
+
+type unifiedResponseWriter struct {
+	http.ResponseWriter
+	statusCode int
+	body       *bytes.Buffer
+}
+
+func newResponseWriter(w http.ResponseWriter) *unifiedResponseWriter {
+	return &unifiedResponseWriter{
+		ResponseWriter: w,
+		statusCode:     http.StatusOK,
+		body:           new(bytes.Buffer),
+	}
+}
+
+func (urw *unifiedResponseWriter) WriteHeader(code int) {
+	urw.statusCode = code
+	urw.ResponseWriter.WriteHeader(code)
+}
+
+func (urw *unifiedResponseWriter) Write(body []byte) (int, error) {
+	urw.body.Write(body)
+	return urw.ResponseWriter.Write(body)
+}
+
+type contextKey string
+
+const responseWriterKey = contextKey("responseWriter")
+
+func metricsMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		urw := newResponseWriter(w)
+		ctx := context.WithValue(r.Context(), responseWriterKey, urw)
+		next.ServeHTTP(urw, r.WithContext(ctx))
+		duration := time.Since(start).Seconds()
+		metrics.HTTPRequestDuration.WithLabelValues(r.URL.Path, r.Method).Observe(duration)
+		metrics.HTTPRequestsTotal.WithLabelValues(r.URL.Path, r.Method, strconv.Itoa(urw.statusCode)).Inc()
+	})
 }
 
 func authenticationMiddleware(next http.Handler, validKeys []string, logger *slog.Logger) http.Handler {
@@ -67,31 +113,39 @@ func rateLimiterMiddleware(next http.Handler, logger *slog.Logger) http.Handler 
 	})
 }
 
-func metricsMiddleware(next http.Handler) http.Handler {
+func cachingMiddleware(next http.Handler, logger *slog.Logger, redisClient *redis.Client) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		start := time.Now()
-		rw := &responseWriter{ResponseWriter: w}
+		if r.Method != http.MethodPost {
+			next.ServeHTTP(w, r)
+			return
+		}
 
-		// Serve the request
-		next.ServeHTTP(rw, r)
+		bodyBytes, err := io.ReadAll(r.Body)
+		if err != nil {
+			logger.Error("failed to read request body for caching", "error", err)
+			http.Error(w, `{"error": "Internal Server Error"}`, http.StatusInternalServerError)
+			return
+		}
+		r.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
 
-		duration := time.Since(start).Seconds()
-		statusCode := rw.statusCode
+		hash := sha256.Sum256(bodyBytes)
+		cacheKey := fmt.Sprintf("cache:%s:%s", r.URL.Path, hex.EncodeToString(hash[:]))
 
-		// Record the metrics
-		metrics.HTTPRequestDuration.WithLabelValues(r.URL.Path, r.Method).Observe(duration)
-		metrics.HTTPRequestsTotal.WithLabelValues(r.URL.Path, r.Method, strconv.Itoa(statusCode)).Inc()
+		cachedResponse, err := redisClient.Get(context.Background(), cacheKey).Bytes()
+		if err == nil {
+			logger.Info("cache hit", "key", cacheKey)
+			w.Header().Set("Content-Type", "application/json")
+			w.Write(cachedResponse)
+			return
+		}
+		logger.Info("cache miss", "key", cacheKey)
+		next.ServeHTTP(w, r)
+		if urw, ok := r.Context().Value(responseWriterKey).(*unifiedResponseWriter); ok {
+			if urw.statusCode >= 200 && urw.statusCode < 300 {
+				redisClient.Set(context.Background(), cacheKey, urw.body.Bytes(), 10*time.Minute)
+			}
+		}
 	})
-}
-
-type responseWriter struct {
-	http.ResponseWriter
-	statusCode int
-}
-
-func (rw *responseWriter) WriteHeader(code int) {
-	rw.statusCode = code
-	rw.ResponseWriter.WriteHeader(code)
 }
 
 func main() {
@@ -118,19 +172,33 @@ func main() {
 		}
 	}()
 
+	redisClient := redis.NewClient(&redis.Options{
+		Addr: "localhost:6379",
+	})
+	if _, err := redisClient.Ping(context.Background()).Result(); err != nil {
+		logger.Error("could not connect to Redis", "error", err)
+		os.Exit(1)
+	}
+	logger.Info("Successfully connected to Redis")
+
 	mux := http.NewServeMux()
 	for _, route := range config.Routes {
 		targetURL, err := url.Parse(route.ServiceURL)
 		if err != nil {
-			logger.Error("invalid service URL in config", "path", route.Path, "url", route.ServiceURL, "error", err)
+			logger.Error("invalid service URL in config", "path", route.Path, "error", err)
 			continue
 		}
 		proxy := httputil.NewSingleHostReverseProxy(targetURL)
+		proxy.Transport = &http.Transport{
+			ResponseHeaderTimeout: 30 * time.Second,
+		}
+
 		proxyHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			logger.Info("request proxied", "path", r.URL.Path, "source_ip", r.RemoteAddr)
 			proxy.ServeHTTP(w, r)
 		})
 		var finalHandler http.Handler = proxyHandler
+		finalHandler = cachingMiddleware(finalHandler, logger, redisClient)
 		finalHandler = rateLimiterMiddleware(finalHandler, logger)
 		finalHandler = authenticationMiddleware(finalHandler, validApiKeys, logger)
 		finalHandler = metricsMiddleware(finalHandler)
@@ -148,7 +216,6 @@ func loadApiKeys(logger *slog.Logger) ([]string, error) {
 	if err := godotenv.Load(".env"); err != nil {
 		logger.Warn("could not load .env file", "error", err)
 	}
-
 	apiKeysEnv := os.Getenv("API_KEYS")
 	if apiKeysEnv == "" {
 		return nil, fmt.Errorf("API_KEYS environment variable is not set")
@@ -161,7 +228,6 @@ func loadConfig(logger *slog.Logger) (*Config, error) {
 	if err != nil {
 		return nil, fmt.Errorf("could not read config file: %w", err)
 	}
-
 	var config Config
 	if err := yaml.Unmarshal(configFile, &config); err != nil {
 		return nil, fmt.Errorf("could not parse config file: %w", err)
