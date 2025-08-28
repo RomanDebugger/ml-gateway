@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/hex"
 	"fmt"
 	"io"
@@ -74,20 +75,28 @@ func metricsMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-func authenticationMiddleware(next http.Handler, validKeys []string, logger *slog.Logger) http.Handler {
-	keySet := make(map[string]struct{})
-	for _, key := range validKeys {
-		keySet[key] = struct{}{}
+func authenticationMiddleware(next http.Handler, hashedKeys []string, logger *slog.Logger) http.Handler {
+	validKeyHashes := make([][]byte, len(hashedKeys))
+	for i, key := range hashedKeys {
+		validKeyHashes[i], _ = hex.DecodeString(key)
 	}
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		apiKey := r.Header.Get("X-API-Key")
-		if _, found := keySet[apiKey]; !found {
-			logger.Warn("invalid API key provided", "key", apiKey, "source_ip", r.RemoteAddr)
+		incomingKey := r.Header.Get("X-API-Key")
+		if incomingKey == "" {
+			logger.Warn("API key missing", "source_ip", r.RemoteAddr)
 			http.Error(w, `{"error": "Unauthorized"}`, http.StatusUnauthorized)
 			return
 		}
-		next.ServeHTTP(w, r)
+		incomingKeyHash := sha256.Sum256([]byte(incomingKey))
+		for _, storedHash := range validKeyHashes {
+			if subtle.ConstantTimeCompare(incomingKeyHash[:], storedHash) == 1 {
+				next.ServeHTTP(w, r)
+				return
+			}
+		}
+		logger.Warn("invalid API key provided (hash comparison failed)", "source_ip", r.RemoteAddr)
+		http.Error(w, `{"error": "Unauthorized"}`, http.StatusUnauthorized)
 	})
 }
 
