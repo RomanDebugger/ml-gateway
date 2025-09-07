@@ -16,13 +16,11 @@ import (
 	"os"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/joho/godotenv"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/redis/go-redis/v9"
-	"golang.org/x/time/rate"
 	"gopkg.in/yaml.v2"
 )
 
@@ -100,21 +98,25 @@ func authenticationMiddleware(next http.Handler, hashedKeys []string, logger *sl
 	})
 }
 
-func rateLimiterMiddleware(next http.Handler, logger *slog.Logger) http.Handler {
-	limiters := make(map[string]*rate.Limiter)
-	var mu sync.Mutex
+func rateLimiterMiddleware(next http.Handler, logger *slog.Logger, redisClient *redis.Client) http.Handler {
+	const limit = 100
+	const window = 60 * time.Second
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		apiKey := r.Header.Get("X-API-Key")
-		mu.Lock()
-		if _, found := limiters[apiKey]; !found {
-			limiters[apiKey] = rate.NewLimiter(5, 10)
-		}
-		limiter := limiters[apiKey]
-		mu.Unlock()
+		key := fmt.Sprintf("rate_limit:%s:%d", apiKey, time.Now().Unix()/int64(window.Seconds()))
+		pipe := redisClient.TxPipeline()
+		count := pipe.Incr(context.Background(), key)
+		pipe.Expire(context.Background(), key, window)
+		_, err := pipe.Exec(context.Background())
 
-		if !limiter.Allow() {
-			logger.Warn("rate limit exceeded", "key", apiKey, "source_ip", r.RemoteAddr)
+		if err != nil {
+			logger.Error("could not execute rate limiter pipeline", "error", err)
+			next.ServeHTTP(w, r)
+			return
+		}
+		if count.Val() > limit {
+			logger.Warn("rate limit exceeded", "key", apiKey, "source_ip", r.RemoteAddr, "count", count.Val())
 			http.Error(w, `{"error": "Too Many Requests"}`, http.StatusTooManyRequests)
 			return
 		}
@@ -208,7 +210,7 @@ func main() {
 		})
 		var finalHandler http.Handler = proxyHandler
 		finalHandler = cachingMiddleware(finalHandler, logger, redisClient)
-		finalHandler = rateLimiterMiddleware(finalHandler, logger)
+		finalHandler = rateLimiterMiddleware(finalHandler, logger, redisClient)
 		finalHandler = authenticationMiddleware(finalHandler, validApiKeys, logger)
 		finalHandler = metricsMiddleware(finalHandler)
 		mux.Handle(route.Path, finalHandler)
